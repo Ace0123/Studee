@@ -1,5 +1,6 @@
 package com.studymate.service;
 
+import com.studymate.model.QuizType;
 import com.studymate.model.Reviewer;
 import com.studymate.model.StudyQuestion;
 import com.studymate.model.StudySession;
@@ -19,12 +20,20 @@ import java.util.List;
 
 /** All SQLite work. Every method opens and closes its own connection (try-with-resources). */
 public class QuestionDatabase {
+    private static final String QUESTION_COLUMNS =
+            "id, reviewer_id, question_type, question_text, correct_answer, accepted_answers, "
+                    + "option_a, option_b, option_c, option_d, correct_option";
+
     private final String databaseUrl;
     private final Path databaseFile;
 
+    /** Opens (or creates) the database in the user's home folder: C:\Users\NAME\StudyMate\studymate.db */
     public QuestionDatabase() {
-        // C:\Users\<you>\StudyMate\studymate.db
-        Path folder = Paths.get(System.getProperty("user.home"), "StudyMate");
+        this(Paths.get(System.getProperty("user.home"), "StudyMate"));
+    }
+
+    /** Same, but in a folder of your choice (used for testing). */
+    public QuestionDatabase(Path folder) {
         try {
             Files.createDirectories(folder);
         } catch (IOException e) {
@@ -32,7 +41,7 @@ public class QuestionDatabase {
         }
         databaseFile = folder.resolve("studymate.db");
         databaseUrl = "jdbc:sqlite:" + databaseFile.toAbsolutePath();
-        createTables();
+        createOrUpgradeTables(folder);
     }
 
     public Path getDatabaseFile() { return databaseFile; }
@@ -49,7 +58,9 @@ public class QuestionDatabase {
         return connection;
     }
 
-    private void createTables() {
+    // ---------------------------------------------------------------- creating / upgrading tables
+
+    private void createOrUpgradeTables(Path folder) {
         String reviewers = "CREATE TABLE IF NOT EXISTS reviewers ("
                 + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                 + "title TEXT NOT NULL UNIQUE COLLATE NOCASE)";
@@ -72,8 +83,80 @@ public class QuestionDatabase {
             statement.execute(reviewers);
             statement.execute(questions);
             statement.execute(sessions);
+
+            // Databases made by the first version of StudyMate lack the new columns.
+            boolean needsUpgrade = !hasColumn(connection, "questions", "question_type");
+            if (needsUpgrade) {
+                backupOldDatabase(folder);
+            }
+            connection.setAutoCommit(false);
+            try {
+                upgradeColumns(connection);
+                connection.commit();
+            } catch (SQLException e) {
+                connection.rollback();
+                throw e;
+            }
         } catch (SQLException e) {
-            throw new DatabaseException("Could not create the database tables.", e);
+            throw new DatabaseException("Could not create or upgrade the database tables.", e);
+        }
+    }
+
+    /** Adds the new columns. Existing rows keep their data and get safe default values. */
+    private void upgradeColumns(Connection connection) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            if (!hasColumn(connection, "questions", "question_type")) {
+                statement.execute("ALTER TABLE questions ADD COLUMN question_type TEXT NOT NULL DEFAULT 'FLASHCARD'");
+                // Questions made by the old PDF import as "Fill in the blank: ..." are real fill-in questions.
+                statement.execute("UPDATE questions SET question_type = 'FILL_BLANK' "
+                        + "WHERE question_text LIKE 'Fill in the blank:%'");
+            }
+            String[] textColumns = {"accepted_answers", "option_a", "option_b", "option_c", "option_d"};
+            for (String column : textColumns) {
+                if (!hasColumn(connection, "questions", column)) {
+                    statement.execute("ALTER TABLE questions ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''");
+                }
+            }
+            if (!hasColumn(connection, "questions", "correct_option")) {
+                statement.execute("ALTER TABLE questions ADD COLUMN correct_option INTEGER NOT NULL DEFAULT -1");
+            }
+            if (!hasColumn(connection, "study_sessions", "quiz_type")) {
+                statement.execute("ALTER TABLE study_sessions ADD COLUMN quiz_type TEXT NOT NULL DEFAULT 'FLASHCARD'");
+            }
+        }
+    }
+
+    private boolean hasColumn(Connection connection, String table, String column) throws SQLException {
+        try (Statement statement = connection.createStatement();
+             ResultSet rows = statement.executeQuery("PRAGMA table_info(" + table + ")")) {
+            while (rows.next()) {
+                if (column.equalsIgnoreCase(rows.getString("name"))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Before the first upgrade, keeps a copy of the old file (only if it already holds data). */
+    private void backupOldDatabase(Path folder) {
+        Path backup = folder.resolve("studymate-backup-before-v1.1.db");
+        try {
+            if (Files.exists(databaseFile) && Files.size(databaseFile) > 0 && !Files.exists(backup)
+                    && queryInt("SELECT COUNT(*) FROM reviewers") > 0) {
+                Files.copy(databaseFile, backup);
+            }
+        } catch (IOException e) {
+            throw new DatabaseException("Could not back up the old database before upgrading it.", e);
+        }
+    }
+
+    /** The id of the row that was just inserted on this connection (works with every SQLite driver version). */
+    private int lastInsertedId(Connection connection) throws SQLException {
+        try (Statement statement = connection.createStatement();
+             ResultSet rows = statement.executeQuery("SELECT last_insert_rowid()")) {
+            rows.next();
+            return rows.getInt(1);
         }
     }
 
@@ -99,14 +182,10 @@ public class QuestionDatabase {
     public Reviewer createReviewer(String title) {
         String clean = validateTitle(title, -1);
         try (Connection connection = openConnection();
-             PreparedStatement statement = connection.prepareStatement(
-                     "INSERT INTO reviewers (title) VALUES (?)", Statement.RETURN_GENERATED_KEYS)) {
+             PreparedStatement statement = connection.prepareStatement("INSERT INTO reviewers (title) VALUES (?)")) {
             statement.setString(1, clean);
             statement.executeUpdate();
-            try (ResultSet keys = statement.getGeneratedKeys()) {
-                keys.next();
-                return new Reviewer(keys.getInt(1), clean, 0);
-            }
+            return new Reviewer(lastInsertedId(connection), clean, 0);
         } catch (SQLException e) {
             throw new DatabaseException("Could not create the reviewer.", e);
         }
@@ -149,16 +228,18 @@ public class QuestionDatabase {
         }
     }
 
+    /** All reviewers (sorted by title) with their question count and the date they were last studied. */
     public List<Reviewer> getAllReviewers() {
-        String sql = "SELECT r.id, r.title, COUNT(q.id) FROM reviewers r "
-                + "LEFT JOIN questions q ON q.reviewer_id = r.id "
-                + "GROUP BY r.id, r.title ORDER BY r.title COLLATE NOCASE";
+        String sql = "SELECT r.id, r.title, "
+                + "(SELECT COUNT(*) FROM questions q WHERE q.reviewer_id = r.id), "
+                + "(SELECT MAX(s.completed_at) FROM study_sessions s WHERE s.reviewer_id = r.id) "
+                + "FROM reviewers r ORDER BY r.title COLLATE NOCASE";
         List<Reviewer> result = new ArrayList<>();
         try (Connection connection = openConnection();
              PreparedStatement statement = connection.prepareStatement(sql);
              ResultSet rows = statement.executeQuery()) {
             while (rows.next()) {
-                result.add(new Reviewer(rows.getInt(1), rows.getString(2), rows.getInt(3)));
+                result.add(new Reviewer(rows.getInt(1), rows.getString(2), rows.getInt(3), rows.getString(4)));
             }
         } catch (SQLException e) {
             throw new DatabaseException("Could not load the reviewers.", e);
@@ -168,16 +249,21 @@ public class QuestionDatabase {
 
     // ---------------------------------------------------------------- questions
 
+    private StudyQuestion readQuestion(ResultSet rows) throws SQLException {
+        String[] options = {rows.getString(7), rows.getString(8), rows.getString(9), rows.getString(10)};
+        return new StudyQuestion(rows.getInt(1), rows.getInt(2), QuizType.fromDatabase(rows.getString(3)),
+                rows.getString(4), rows.getString(5), rows.getString(6), options, rows.getInt(11));
+    }
+
     public List<StudyQuestion> getQuestions(int reviewerId) {
-        String sql = "SELECT id, reviewer_id, question_text, correct_answer FROM questions "
-                + "WHERE reviewer_id = ? ORDER BY id";
+        String sql = "SELECT " + QUESTION_COLUMNS + " FROM questions WHERE reviewer_id = ? ORDER BY id";
         List<StudyQuestion> result = new ArrayList<>();
         try (Connection connection = openConnection();
              PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setInt(1, reviewerId);
             try (ResultSet rows = statement.executeQuery()) {
                 while (rows.next()) {
-                    result.add(new StudyQuestion(rows.getInt(1), rows.getInt(2), rows.getString(3), rows.getString(4)));
+                    result.add(readQuestion(rows));
                 }
             }
         } catch (SQLException e) {
@@ -186,34 +272,61 @@ public class QuestionDatabase {
         return result;
     }
 
-    public StudyQuestion addQuestion(int reviewerId, String questionText, String correctAnswer) {
-        String question = requireQuestionText(questionText);
-        String answer = correctAnswer == null ? "" : correctAnswer.trim();
+    /** Checks and cleans a question before saving. Throws IllegalArgumentException with a friendly message. */
+    private void prepareForSave(StudyQuestion question) {
+        String text = question.getQuestionText() == null ? "" : question.getQuestionText().trim();
+        if (text.isEmpty()) {
+            throw new IllegalArgumentException("The question text cannot be empty.");
+        }
+        question.setQuestionText(text);
+        question.setCorrectAnswer(question.getCorrectAnswer().trim());
+        if (question.getType() == QuizType.MULTIPLE_CHOICE && !question.isValidMultipleChoice()) {
+            throw new IllegalArgumentException(
+                    "A multiple choice question needs four different options and one option marked as correct.");
+        }
+    }
+
+    /** Sets the 10 values shared by INSERT and UPDATE, starting at parameter number 'first'. */
+    private void bindQuestionValues(PreparedStatement statement, StudyQuestion question, int first) throws SQLException {
+        statement.setString(first, question.getType().name());
+        statement.setString(first + 1, question.getQuestionText());
+        statement.setString(first + 2, question.getCorrectAnswer()); // for multiple choice: the correct option's text
+        statement.setString(first + 3, question.getAcceptedAnswers().trim());
+        for (int i = 0; i < StudyQuestion.OPTION_COUNT; i++) {
+            statement.setString(first + 4 + i, question.getOption(i));
+        }
+        statement.setInt(first + 8, question.getCorrectOption());
+    }
+
+    private static final String INSERT_QUESTION = "INSERT INTO questions (reviewer_id, question_type, question_text, "
+            + "correct_answer, accepted_answers, option_a, option_b, option_c, option_d, correct_option) "
+            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    /** Saves a new question for its reviewer and returns it with its new id. */
+    public StudyQuestion addQuestion(StudyQuestion question) {
+        prepareForSave(question);
         try (Connection connection = openConnection();
-             PreparedStatement statement = connection.prepareStatement(
-                     "INSERT INTO questions (reviewer_id, question_text, correct_answer) VALUES (?, ?, ?)",
-                     Statement.RETURN_GENERATED_KEYS)) {
-            statement.setInt(1, reviewerId);
-            statement.setString(2, question);
-            statement.setString(3, answer);
+             PreparedStatement statement = connection.prepareStatement(INSERT_QUESTION)) {
+            statement.setInt(1, question.getReviewerId());
+            bindQuestionValues(statement, question, 2);
             statement.executeUpdate();
-            try (ResultSet keys = statement.getGeneratedKeys()) {
-                keys.next();
-                return new StudyQuestion(keys.getInt(1), reviewerId, question, answer);
-            }
+            return new StudyQuestion(lastInsertedId(connection), question.getReviewerId(), question.getType(),
+                    question.getQuestionText(), question.getCorrectAnswer(), question.getAcceptedAnswers(),
+                    question.getOptions(), question.getCorrectOption());
         } catch (SQLException e) {
             throw new DatabaseException("Could not save the question.", e);
         }
     }
 
     public void updateQuestion(StudyQuestion question) {
-        String text = requireQuestionText(question.getQuestionText());
+        prepareForSave(question);
+        String sql = "UPDATE questions SET question_type = ?, question_text = ?, correct_answer = ?, "
+                + "accepted_answers = ?, option_a = ?, option_b = ?, option_c = ?, option_d = ?, correct_option = ? "
+                + "WHERE id = ?";
         try (Connection connection = openConnection();
-             PreparedStatement statement = connection.prepareStatement(
-                     "UPDATE questions SET question_text = ?, correct_answer = ? WHERE id = ?")) {
-            statement.setString(1, text);
-            statement.setString(2, question.getCorrectAnswer().trim());
-            statement.setInt(3, question.getId());
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            bindQuestionValues(statement, question, 1);
+            statement.setInt(10, question.getId());
             statement.executeUpdate();
         } catch (SQLException e) {
             throw new DatabaseException("Could not update the question.", e);
@@ -232,14 +345,13 @@ public class QuestionDatabase {
 
     /** Saves many questions at once (used by PDF import). Returns how many were saved. */
     public int addQuestions(int reviewerId, List<StudyQuestion> questions) {
-        String sql = "INSERT INTO questions (reviewer_id, question_text, correct_answer) VALUES (?, ?, ?)";
         try (Connection connection = openConnection()) {
             connection.setAutoCommit(false);
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            try (PreparedStatement statement = connection.prepareStatement(INSERT_QUESTION)) {
                 for (StudyQuestion question : questions) {
+                    prepareForSave(question);
                     statement.setInt(1, reviewerId);
-                    statement.setString(2, requireQuestionText(question.getQuestionText()));
-                    statement.setString(3, question.getCorrectAnswer().trim());
+                    bindQuestionValues(statement, question, 2);
                     statement.addBatch();
                 }
                 statement.executeBatch();
@@ -254,34 +366,29 @@ public class QuestionDatabase {
         }
     }
 
-    private String requireQuestionText(String text) {
-        String clean = text == null ? "" : text.trim();
-        if (clean.isEmpty()) {
-            throw new IllegalArgumentException("The question text cannot be empty.");
-        }
-        return clean;
-    }
-
     // ---------------------------------------------------------------- sessions & statistics
 
-    public void saveSession(int reviewerId, int totalAnswered, int correct, int incorrect, double percentage) {
-        String sql = "INSERT INTO study_sessions (reviewer_id, total_answered, correct_count, incorrect_count, "
-                + "percentage, completed_at) VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))";
+    public void saveSession(int reviewerId, QuizType quizType, int totalAnswered, int correct, int incorrect,
+                            double percentage) {
+        String sql = "INSERT INTO study_sessions (reviewer_id, quiz_type, total_answered, correct_count, "
+                + "incorrect_count, percentage, completed_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))";
         try (Connection connection = openConnection();
              PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setInt(1, reviewerId);
-            statement.setInt(2, totalAnswered);
-            statement.setInt(3, correct);
-            statement.setInt(4, incorrect);
-            statement.setDouble(5, percentage);
+            statement.setString(2, quizType.name());
+            statement.setInt(3, totalAnswered);
+            statement.setInt(4, correct);
+            statement.setInt(5, incorrect);
+            statement.setDouble(6, percentage);
             statement.executeUpdate();
         } catch (SQLException e) {
             throw new DatabaseException("Could not save the session result.", e);
         }
     }
 
+    /** Newest sessions first. Pass -1 to get all of them. */
     public List<StudySession> getRecentSessions(int limit) {
-        String sql = "SELECT s.id, s.reviewer_id, r.title, s.total_answered, s.correct_count, "
+        String sql = "SELECT s.id, s.reviewer_id, r.title, s.quiz_type, s.total_answered, s.correct_count, "
                 + "s.incorrect_count, s.percentage, s.completed_at "
                 + "FROM study_sessions s JOIN reviewers r ON r.id = s.reviewer_id ORDER BY s.id DESC LIMIT ?";
         List<StudySession> result = new ArrayList<>();
@@ -290,8 +397,9 @@ public class QuestionDatabase {
             statement.setInt(1, limit);
             try (ResultSet rows = statement.executeQuery()) {
                 while (rows.next()) {
-                    result.add(new StudySession(rows.getInt(1), rows.getInt(2), rows.getString(3), rows.getInt(4),
-                            rows.getInt(5), rows.getInt(6), rows.getDouble(7), rows.getString(8)));
+                    result.add(new StudySession(rows.getInt(1), rows.getInt(2), rows.getString(3),
+                            QuizType.fromDatabase(rows.getString(4)), rows.getInt(5), rows.getInt(6),
+                            rows.getInt(7), rows.getDouble(8), rows.getString(9)));
                 }
             }
         } catch (SQLException e) {
@@ -300,9 +408,28 @@ public class QuestionDatabase {
         return result;
     }
 
+    public List<StudySession> getAllSessions() { return getRecentSessions(-1); }
+
+    public void deleteAllSessions() {
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement("DELETE FROM study_sessions")) {
+            statement.executeUpdate();
+        } catch (SQLException e) {
+            throw new DatabaseException("Could not clear the study history.", e);
+        }
+    }
+
     public int getReviewerCount() { return queryInt("SELECT COUNT(*) FROM reviewers"); }
     public int getTotalQuestionCount() { return queryInt("SELECT COUNT(*) FROM questions"); }
     public int getSessionCount() { return queryInt("SELECT COUNT(*) FROM study_sessions"); }
+
+    /** Questions that are complete (have a correct answer, or four options and a correct option). */
+    public int getReadyQuestionCount() {
+        return queryInt("SELECT COUNT(*) FROM questions WHERE "
+                + "(question_type = 'MULTIPLE_CHOICE' AND TRIM(option_a) <> '' AND TRIM(option_b) <> '' "
+                + "AND TRIM(option_c) <> '' AND TRIM(option_d) <> '' AND correct_option BETWEEN 0 AND 3) "
+                + "OR (question_type <> 'MULTIPLE_CHOICE' AND TRIM(correct_answer) <> '')");
+    }
 
     public double getAverageScore() {
         try (Connection connection = openConnection();

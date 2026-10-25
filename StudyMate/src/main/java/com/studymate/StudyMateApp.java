@@ -1,6 +1,8 @@
 package com.studymate;
 
+import com.studymate.controller.AboutController;
 import com.studymate.controller.DashboardController;
+import com.studymate.controller.HistoryController;
 import com.studymate.controller.QuestionEditorController;
 import com.studymate.controller.ReviewerController;
 import com.studymate.controller.StudyController;
@@ -23,7 +25,7 @@ import javafx.stage.Stage;
 
 import java.util.List;
 
-/** Main class: creates the window, the sidebar and switches between the four screens. */
+/** Main class: creates the window, the sidebar and switches between the screens. */
 public class StudyMateApp extends Application {
     private QuestionDatabase database;
     private final PdfService pdfService = new PdfService();
@@ -34,11 +36,15 @@ public class StudyMateApp extends Application {
     private ReviewerController reviewerController;
     private QuestionEditorController editorController;
     private StudyController studyController;
+    private HistoryController historyController;
+    private AboutController aboutController;
 
     private Button dashboardButton;
     private Button reviewersButton;
     private Button editorButton;
     private Button studyButton;
+    private Button historyButton;
+    private Button aboutButton;
 
     public static void main(String[] args) {
         launch(args);
@@ -66,6 +72,8 @@ public class StudyMateApp extends Application {
         reviewerController = new ReviewerController(this);
         editorController = new QuestionEditorController(this);
         studyController = new StudyController(this);
+        historyController = new HistoryController(this);
+        aboutController = new AboutController(this);
 
         rootLayout = new BorderPane();
         rootLayout.getStyleClass().add("main-area");
@@ -95,26 +103,30 @@ public class StudyMateApp extends Application {
 
     private VBox buildSidebar() {
         Label name = UiHelper.label("StudyMate", "app-name");
-        Label tagline = UiHelper.label("Your offline flashcard reviewer", "app-tagline");
+        Label tagline = UiHelper.label("Your offline study companion", "app-tagline");
 
         dashboardButton = UiHelper.button("Dashboard", "nav-button");
         reviewersButton = UiHelper.button("My Reviewers", "nav-button");
         editorButton = UiHelper.button("Question Editor", "nav-button");
         studyButton = UiHelper.button("Study Mode", "nav-button");
-        for (Button button : List.of(dashboardButton, reviewersButton, editorButton, studyButton)) {
+        historyButton = UiHelper.button("Study History", "nav-button");
+        aboutButton = UiHelper.button("About", "nav-button");
+        for (Button button : allNavButtons()) {
             button.setMaxWidth(Double.MAX_VALUE);
         }
         dashboardButton.setOnAction(e -> showDashboard());
         reviewersButton.setOnAction(e -> showReviewers());
         editorButton.setOnAction(e -> showEditor(null));
         studyButton.setOnAction(e -> showStudy(null));
+        historyButton.setOnAction(e -> showHistory());
+        aboutButton.setOnAction(e -> showAbout());
 
         Region spacer = new Region();
         VBox.setVgrow(spacer, Priority.ALWAYS);
         Label footer = UiHelper.label("Data is saved in:\n" + database.getDatabaseFile(), "footer-note");
 
         VBox sidebar = new VBox(8, name, tagline, new Region(), dashboardButton, reviewersButton,
-                editorButton, studyButton, spacer, footer);
+                editorButton, studyButton, historyButton, aboutButton, spacer, footer);
         sidebar.getStyleClass().add("sidebar");
         sidebar.setPadding(new Insets(26, 16, 20, 16));
         sidebar.setPrefWidth(240);
@@ -122,8 +134,12 @@ public class StudyMateApp extends Application {
         return sidebar;
     }
 
+    private List<Button> allNavButtons() {
+        return List.of(dashboardButton, reviewersButton, editorButton, studyButton, historyButton, aboutButton);
+    }
+
     private void setActive(Button active) {
-        for (Button button : List.of(dashboardButton, reviewersButton, editorButton, studyButton)) {
+        for (Button button : allNavButtons()) {
             button.getStyleClass().remove("nav-button-active");
         }
         active.getStyleClass().add("nav-button-active");
@@ -155,6 +171,17 @@ public class StudyMateApp extends Application {
         studyController.refresh(reviewer);
         rootLayout.setCenter(studyController.getView());
         setActive(studyButton);
+    }
+
+    public void showHistory() {
+        historyController.refresh();
+        rootLayout.setCenter(historyController.getView());
+        setActive(historyButton);
+    }
+
+    public void showAbout() {
+        rootLayout.setCenter(aboutController.getView());
+        setActive(aboutButton);
     }
 
     public QuestionDatabase getDatabase() { return database; }

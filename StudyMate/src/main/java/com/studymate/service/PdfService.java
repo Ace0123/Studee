@@ -1,6 +1,7 @@
 package com.studymate.service;
 
 import com.studymate.model.DraftQuestion;
+import com.studymate.model.QuizType;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
@@ -98,7 +99,7 @@ public class PdfService {
         } else {
             question = "What is " + subject + "?";
         }
-        return new DraftQuestion(question, sentence, rest);
+        return new DraftQuestion(QuizType.FLASHCARD, question, sentence, rest);
     }
 
     /** Rule 2: blank out the longest word of the sentence. */
@@ -121,6 +122,6 @@ public class PdfService {
         }
         words[bestIndex] = words[bestIndex].replace(bestWord, "_____");
         String question = "Fill in the blank: " + String.join(" ", words);
-        return new DraftQuestion(question, sentence, bestWord);
+        return new DraftQuestion(QuizType.FILL_BLANK, question, sentence, bestWord);
     }
 }

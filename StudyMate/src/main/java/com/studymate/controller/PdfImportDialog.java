@@ -203,7 +203,7 @@ public class PdfImportDialog {
                 List<StudyQuestion> toSave = new ArrayList<>();
                 for (DraftQuestion draft : chosen) {
                     String answer = prefillBox.isSelected() ? draft.getSuggestedAnswer() : "";
-                    toSave.add(new StudyQuestion(0, target.getId(), draft.getQuestion(), answer));
+                    toSave.add(new StudyQuestion(0, target.getId(), draft.getType(), draft.getQuestion(), answer, "", null, -1));
                 }
                 importedCount[0] = db.addQuestions(target.getId(), toSave);
                 importedInto[0] = target;
